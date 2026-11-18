@@ -26,3 +26,39 @@ jobs:
 
       - name: Unit tests
         run: bun test
+
+  deploy:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: https://todosst-agent.vercel.app
+    env:
+      VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Pull Vercel project settings
+        run: bunx vercel@66.1.0 pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      # Pushes Convex functions and schema, then runs the Vercel build with
+      # NEXT_PUBLIC_CONVEX_URL pointed at the production deployment.
+      - name: Deploy Convex and build
+        run: bunx convex deploy --cmd 'bunx vercel@66.1.0 build --prod --token="$VERCEL_TOKEN"' --cmd-url-env-var-name NEXT_PUBLIC_CONVEX_URL
+
+      - name: Deploy to Vercel
+        run: bunx vercel@66.1.0 deploy --prebuilt --prod --token="$VERCEL_TOKEN"
