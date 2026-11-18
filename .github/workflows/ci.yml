@@ -43,6 +43,14 @@ jobs:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
     steps:
+      - name: Check the deploy key targets this app's Convex deployment
+        run: |
+          target="${CONVEX_DEPLOY_KEY%%|*}"
+          if [ "$target" != "prod:fantastic-sandpiper-942" ]; then
+            echo "::error::CONVEX_DEPLOY_KEY targets '$target', expected prod:fantastic-sandpiper-942 (project todosst-agent)"
+            exit 1
+          fi
+
       - uses: actions/checkout@v5
 
       - uses: oven-sh/setup-bun@v2
