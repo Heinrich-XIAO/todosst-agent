@@ -6,6 +6,7 @@ import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import { diffLines, diffStat } from "@/lib/diff";
 import type { AgentRun } from "./useAgent";
+import { useDictation } from "./useDictation";
 
 type Change = { path: string; before: string | null; after: string | null };
 export type Message = {
@@ -125,41 +126,61 @@ export function Composer({
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
   }, [text]);
+  const voice = useDictation(setText);
   const submit = () => {
     if (busy || !text.trim()) return;
+    voice.cancel();
     onSend(text.trim());
     setText("");
   };
   return (
-    <div className="flex items-end gap-2 rounded-xl border border-line bg-panel p-2 focus-within:border-accent">
-      <textarea
-        ref={ref}
-        rows={1}
-        autoFocus={autoFocus}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-            e.preventDefault();
-            submit();
-          }
-        }}
-        placeholder="Tell the agent what you want…"
-        className="flex-1 resize-none bg-transparent px-2 py-1.5 outline-none placeholder:text-muted"
-      />
-      {busy ? (
-        <button onClick={onStop} className="rounded-lg border border-line px-3 py-1.5 text-sm text-muted hover:text-ink">
-          Stop
-        </button>
-      ) : (
-        <button
-          onClick={submit}
-          disabled={!text.trim()}
-          className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
-        >
-          Send
-        </button>
-      )}
+    <div>
+      <div className="flex items-end gap-2 rounded-xl border border-line bg-panel p-2 focus-within:border-accent">
+        <textarea
+          ref={ref}
+          rows={1}
+          autoFocus={autoFocus}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          placeholder={voice.listening ? "Listening…" : "Tell the agent what you want…"}
+          className="flex-1 resize-none bg-transparent px-2 py-1.5 outline-none placeholder:text-muted"
+        />
+        {voice.supported && (
+          <button
+            type="button"
+            onClick={() => (voice.listening ? voice.stop() : voice.start(text))}
+            aria-label={voice.listening ? "Stop voice input" : "Speak"}
+            aria-pressed={voice.listening}
+            title={voice.listening ? "Stop listening" : "Speak"}
+            className={`rounded-lg p-1.5 ${voice.listening ? "bg-late/15 text-late animate-pulse" : "text-muted hover:text-ink"}`}
+          >
+            <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <rect x="9" y="3" width="6" height="11" rx="3" />
+              <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+            </svg>
+          </button>
+        )}
+        {busy ? (
+          <button onClick={onStop} className="rounded-lg border border-line px-3 py-1.5 text-sm text-muted hover:text-ink">
+            Stop
+          </button>
+        ) : (
+          <button
+            onClick={submit}
+            disabled={!text.trim()}
+            className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+          >
+            Send
+          </button>
+        )}
+      </div>
+      {voice.error && <p className="mt-1 px-2 text-xs text-late">{voice.error}</p>}
     </div>
   );
 }
