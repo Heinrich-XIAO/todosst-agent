@@ -8,6 +8,7 @@ import { AgentPanel, Composer, type Message } from "./AgentPanel";
 import { AuthForm } from "./AuthForm";
 import { CodeView } from "./CodeView";
 import { TodayView } from "./TodayView";
+import { TransferPanel } from "./TransferPanel";
 import { useAgent } from "./useAgent";
 import { useProgram } from "./useProgram";
 
@@ -29,6 +30,7 @@ function Workspace() {
   const agent = useAgent(program.files, program.log, prior);
   const [tab, setTab] = useState<Tab>("today");
   const [file, setFile] = useState<string | null>(null);
+  const [moving, setMoving] = useState(false);
 
   useEffect(() => {
     seed().catch(() => {});
@@ -70,10 +72,18 @@ function Workspace() {
                 ))}
             </nav>
           </div>
-          <button onClick={() => signOut()} className="text-sm text-muted hover:text-ink">
-            sign out
-          </button>
+          <div className="flex items-center gap-4">
+            <button onClick={() => setMoving(true)} className="text-sm text-muted hover:text-ink" title="Move to and from todosst">
+              todosst ⇄
+            </button>
+            <button onClick={() => signOut()} className="text-sm text-muted hover:text-ink">
+              sign out
+            </button>
+          </div>
         </header>
+        {moving && (
+          <TransferPanel files={program.files} log={program.log} evaluation={program.evaluation} onClose={() => setMoving(false)} />
+        )}
 
         <main className="min-h-0 flex-1 overflow-hidden">
           <div className={`h-full overflow-y-auto scroll-thin ${tab === "today" ? "block" : tab === "agent" ? "hidden lg:block" : "hidden"}`}>

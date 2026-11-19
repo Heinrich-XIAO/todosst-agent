@@ -58,7 +58,8 @@ function Check({ item, onLog }: { item: Item; onLog: AddLog }) {
 
 function Counter({ item, onLog }: { item: Item; onLog: AddLog }) {
   const step = stepOf(item);
-  const pct = Math.min(100, (item.progress / item.goal) * 100);
+  // goal: Infinity is an open tally (a todosst count task without a goal)
+  const pct = Number.isFinite(item.goal) ? Math.min(100, (item.progress / item.goal) * 100) : 0;
   return (
     <div className="flex items-center gap-1.5 shrink-0">
       <button
@@ -71,7 +72,8 @@ function Counter({ item, onLog }: { item: Item; onLog: AddLog }) {
       </button>
       <div className="w-20 text-center">
         <div className="font-mono text-xs tabular-nums">
-          {item.progress}/{item.goal}
+          {item.progress}
+          {Number.isFinite(item.goal) ? `/${item.goal}` : ""}
           {item.unit ? ` ${item.unit}` : ""}
         </div>
         <div className="h-1 rounded-full bg-line mt-1 overflow-hidden">
@@ -94,7 +96,7 @@ function Row({ item, onLog, onOpenFile }: { item: Item; onLog: AddLog; onOpenFil
   const done = item.state === "done";
   const meta = [
     win,
-    item.per === "week" ? "this week" : item.per === "month" ? "this month" : null,
+    item.per === "week" ? "this week" : item.per === "month" ? "this month" : item.per === "year" ? "this year" : null,
     item.state === "late" && item.date ? `due ${shortDate(item.date)}` : null,
     item.waitingFor ? `after ${item.waitingFor}` : null,
   ].filter(Boolean);

@@ -26,7 +26,9 @@ export default defineSchema({
     period: v.string(),
     amount: v.number(),
     at: v.number(),
-  }).index("by_user_at", ["userId", "at"]),
+  })
+    .index("by_user_at", ["userId", "at"])
+    .index("by_user_task_period", ["userId", "task", "period"]),
 
   // The conversation and every change to the program. A user message, the
   // agent's reply carrying the file changes it made, or a hand edit.

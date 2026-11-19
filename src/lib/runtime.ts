@@ -4,12 +4,14 @@
 // time T" from those definitions plus the completion log. Pure: no DOM, no
 // network. The browser runs it inside a Web Worker.
 
+import { formatRrule, isRruleSpec, parseRrule, ruleAnchored, ruleOccurs, rulePer } from "./rrule";
+
 export type Files = Record<string, string>;
 
 // One append-only completion record. amount is negative for an undo.
 export type LogEntry = { task: string; period: string; amount: number; at: number };
 
-export type Per = "day" | "week" | "month" | "once";
+export type Per = "day" | "week" | "month" | "year" | "once";
 
 export type ItemState = "now" | "later" | "late" | "waiting" | "done";
 
@@ -39,7 +41,25 @@ export type DayView = { date: string; items: Item[]; notes: Note[] };
 
 export type Evaluation = { days: DayView[]; errors: ProgramError[]; tasks: TaskInfo[] };
 
-export type TaskInfo = { id: string; title: string; file: string; per: Per; repeat: string; goal: number; unit: string };
+export type TaskInfo = {
+  id: string;
+  title: string;
+  file: string;
+  per: Per;
+  repeat: string;
+  goal: number;
+  unit: string;
+  // The schedule as an RRULE body ("FREQ=WEEKLY;BYDAY=MO"), with its start
+  // date when the phase matters; null for one-off tasks, "custom" for
+  // function repeats. Used to export the program to todosst.
+  rrule: string | null;
+  start?: string;
+  date?: string;
+  from?: string;
+  until?: string;
+  group?: string;
+  notes?: string;
+};
 
 export type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 
@@ -85,6 +105,8 @@ type TaskDef = {
   file: string;
   per: Per;
   repeatLabel: string;
+  rrule: string | null;
+  start?: string;
   occurs: RepeatFn;
   date?: string;
   from?: string;
@@ -150,6 +172,7 @@ export function periodKey(per: Per, date: string): string {
   if (per === "day") return date;
   if (per === "once") return "once";
   const d = parseDate(date);
+  if (per === "year") return String(d.getFullYear());
   if (per === "month") return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
   const monday = new Date(d);
   monday.setDate(d.getDate() - ((d.getDay() + 6) % 7));
@@ -168,41 +191,96 @@ function minutesOf(hhmm: string): number {
   return h * 60 + m;
 }
 
-type Repeat = { per: Per; occurs: RepeatFn; label: string };
+// rrule: the same schedule as an RRULE body, "custom" for functions, null
+// for one-offs. anchor: the start date, when the schedule depends on one.
+type Repeat = { per: Per; occurs: RepeatFn; label: string; rrule: string | null; anchor?: string };
+
+const RFC: Record<Weekday, string> = { mon: "MO", tue: "TU", wed: "WE", thu: "TH", fri: "FR", sat: "SA", sun: "SU" };
+const RFC_ORDER: Weekday[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const DEFAULT_ANCHOR = "2026-01-01";
+
+function rruleRepeat(spec: string, start: string | undefined): Repeat {
+  const rule = parseRrule(spec);
+  if (start) {
+    parseDate(start);
+    rule.dtstart = start;
+  }
+  const anchorDate = rule.dtstart ?? DEFAULT_ANCHOR;
+  const anchor = dayInfo(anchorDate);
+  const per = rulePer(rule);
+  let occurs: RepeatFn = (d) => ruleOccurs(rule, anchor, d);
+  if (rule.count !== null) {
+    // the first COUNT occurrences (by period), counted from the anchor
+    let periods: Set<string> | null = null;
+    const base = occurs;
+    const limit = rule.count;
+    occurs = (d) => {
+      if (!periods) {
+        const found = new Set<string>();
+        let date = anchorDate;
+        for (let i = 0; i < 366 * 30 && found.size < limit; i++, date = addDays(date, 1)) {
+          if (base(dayInfo(date))) found.add(periodKey(per, date));
+        }
+        periods = found;
+      }
+      return base(d) && periods.has(periodKey(per, d.date));
+    };
+  }
+  const body = formatRrule(rule);
+  const anchored = ruleAnchored(rule) || rule.dtstart !== null;
+  return { per, occurs, label: body, rrule: body, anchor: anchored ? anchorDate : undefined };
+}
 
 const always: RepeatFn = () => true;
 
 // Turns a repeat spec into the days a task occurs on and the period its goal
 // counts over. Unknown specs throw so the author sees the mistake.
 export function parseRepeat(spec: string | RepeatFn | undefined, start: string | undefined): Repeat {
-  if (typeof spec === "function") return { per: "day", occurs: spec, label: "custom" };
-  if (spec === undefined) return { per: "once", occurs: always, label: "once" };
+  if (typeof spec === "function") return { per: "day", occurs: spec, label: "custom", rrule: "custom" };
+  if (spec === undefined) return { per: "once", occurs: always, label: "once", rrule: null };
+  if (isRruleSpec(String(spec))) {
+    try {
+      return rruleRepeat(String(spec), start);
+    } catch (err) {
+      throw new Error(`repeat "${spec}": ${message(err)}`);
+    }
+  }
   const s = String(spec).toLowerCase().trim().replace(/\s+/g, " ");
-  if (s === "daily" || s === "every day") return { per: "day", occurs: always, label: s };
-  if (s === "weekdays") return { per: "day", occurs: (d) => d.weekday !== "sat" && d.weekday !== "sun", label: s };
-  if (s === "weekends") return { per: "day", occurs: (d) => d.weekday === "sat" || d.weekday === "sun", label: s };
-  if (s === "weekly" || s === "every week") return { per: "week", occurs: always, label: "weekly" };
-  if (s === "monthly" || s === "every month") return { per: "month", occurs: always, label: "monthly" };
-  if (s === "once") return { per: "once", occurs: always, label: "once" };
+  if (s === "daily" || s === "every day") return { per: "day", occurs: always, label: s, rrule: "FREQ=DAILY" };
+  if (s === "weekdays") {
+    return { per: "day", occurs: (d) => d.weekday !== "sat" && d.weekday !== "sun", label: s, rrule: "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR" };
+  }
+  if (s === "weekends") return { per: "day", occurs: (d) => d.weekday === "sat" || d.weekday === "sun", label: s, rrule: "FREQ=WEEKLY;BYDAY=SA,SU" };
+  if (s === "weekly" || s === "every week") return { per: "week", occurs: always, label: "weekly", rrule: "FREQ=WEEKLY" };
+  if (s === "monthly" || s === "every month") return { per: "month", occurs: always, label: "monthly", rrule: "FREQ=MONTHLY" };
+  if (s === "yearly" || s === "every year") return { per: "year", occurs: always, label: "yearly", rrule: "FREQ=YEARLY" };
+  if (s === "once") return { per: "once", occurs: always, label: "once", rrule: null };
   let m = /^every (\d+) days?$/.exec(s);
   if (m) {
     const n = Number(m[1]);
     if (n < 1) throw new Error(`repeat "${spec}": interval must be at least 1`);
-    const anchor = dayInfo(start ?? "2026-01-01").index;
-    return { per: "day", occurs: (d) => (((d.index - anchor) % n) + n) % n === 0, label: s };
+    const anchor = dayInfo(start ?? DEFAULT_ANCHOR).index;
+    return {
+      per: "day",
+      occurs: (d) => (((d.index - anchor) % n) + n) % n === 0,
+      label: s,
+      rrule: n === 1 ? "FREQ=DAILY" : `FREQ=DAILY;INTERVAL=${n}`,
+      anchor: n > 1 ? (start ?? DEFAULT_ANCHOR) : undefined,
+    };
   }
   m = /^monthly (?:on )?(?:the )?(\d{1,2})(?:st|nd|rd|th)?$/.exec(s);
   if (m) {
     const n = Number(m[1]);
-    return { per: "day", occurs: (d) => d.day === n, label: s };
+    return { per: "day", occurs: (d) => d.day === n, label: s, rrule: `FREQ=MONTHLY;BYMONTHDAY=${n}` };
   }
   const days = s.replace(/^(every|on) /, "").split(/[ ,]+/).filter(Boolean);
   if (days.length && days.every((w) => DAY_ALIASES[w])) {
     const set = new Set(days.map((w) => DAY_ALIASES[w]));
-    return { per: "day", occurs: (d) => set.has(d.weekday), label: [...set].join(",") };
+    const byday = RFC_ORDER.filter((w) => set.has(w)).map((w) => RFC[w]).join(",");
+    return { per: "day", occurs: (d) => set.has(d.weekday), label: [...set].join(","), rrule: `FREQ=WEEKLY;BYDAY=${byday}` };
   }
   throw new Error(
-    `unknown repeat "${spec}". Use daily, weekdays, weekends, weekly, monthly, "mon,thu", "every 3 days", "monthly 15", or a function (day) => boolean`,
+    `unknown repeat "${spec}". Use daily, weekdays, weekends, weekly, monthly, yearly, "mon,thu", "every 3 days", "monthly 15", an RRULE like "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO", or a function (day) => boolean`,
   );
 }
 
@@ -251,6 +329,8 @@ export function load(files: Files, compile: Compile): Program {
         file,
         per: opts.per ?? repeat.per,
         repeatLabel: opts.date ? `on ${opts.date}` : repeat.label,
+        rrule: repeat.rrule,
+        start: repeat.anchor,
         occurs: repeat.occurs,
         date: opts.date,
         from: parseTime(opts.from, `task("${title}").from`),
@@ -494,6 +574,13 @@ export function evaluate(files: Files, log: LogEntry[], opts: { now: number; day
     repeat: t.repeatLabel,
     goal: t.goal,
     unit: t.unit,
+    rrule: t.rrule,
+    start: t.start,
+    date: t.date,
+    from: t.from,
+    until: t.until,
+    group: t.group,
+    notes: t.notes,
   }));
   return { days, errors, tasks };
 }

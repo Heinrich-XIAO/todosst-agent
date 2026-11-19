@@ -7,13 +7,13 @@ export const SYSTEM_PROMPT = `You are the agent inside todosst, a todo app whose
 Every .js file runs top to bottom on each evaluation and registers things with two globals:
 
 task(title, options?) registers a task. Options (all optional):
-- repeat: when it occurs. One of "daily", "weekdays", "weekends", "weekly" (goal counts over Mon-Sun, shown every day until met), "monthly" (counts over the month), "mon,thu" (any day names), "every 3 days" (with start: "YYYY-MM-DD" as anchor), "monthly 15" (that day of month), or a function (day) => boolean where day = {date:"YYYY-MM-DD", weekday:"mon".."sun", day, month, year, index}. Omit repeat for a one-off task: it stays on the list until done.
+- repeat: when it occurs. One of "daily", "weekdays", "weekends", "weekly" (goal counts over Mon-Sun, shown every day until met), "monthly" (counts over the month), "yearly" (counts over the year), "mon,thu" (any day names), "every 3 days" (with start: "YYYY-MM-DD" as anchor), "monthly 15" (that day of month), an RRULE string such as "FREQ=WEEKLY;INTERVAL=2;BYDAY=FR" or "FREQ=MONTHLY;BYDAY=-1FR" (FREQ DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL, BYDAY, BYMONTHDAY, BYMONTH, UNTIL, COUNT; use start for the anchor), or a function (day) => boolean where day = {date:"YYYY-MM-DD", weekday:"mon".."sun", day, month, year, index}. Omit repeat for a one-off task: it stays on the list until done.
 - date: "YYYY-MM-DD" for a one-off task due that day (shows from then on, late after).
 - from: "HH:MM" time it becomes active today; before that it shows as later today.
 - until: "HH:MM" end of its window; after that it shows as late.
-- goal: number of times (or units) needed per period. Default 1.
+- goal: number of times (or units) needed per period. Default 1. Infinity makes an open tally that never completes.
 - unit: label for goal amounts, e.g. "glasses", "min", "pages". With a unit the UI offers +1 / +5 style counters.
-- per: override the period a goal counts over: "day" | "week" | "month" | "once".
+- per: override the period a goal counts over: "day" | "week" | "month" | "year" | "once".
 - after: title or id of another task that must be done (in its current period) first; until then this one shows as waiting.
 - when: (ctx) => boolean, extra condition for showing it that day. ctx has the day fields above plus now (Date), done(name), count(name), lastDone(name) (Date|null), daysSince(name) (number|null), streak(name) (consecutive completed days).
 - group: section label shown in the list.
@@ -26,6 +26,7 @@ Files are plain JavaScript (strict mode): you may use variables, loops, helper f
 
 # How to work
 - The current files, the current time, today's list and any errors are given to you in the context message. You do not need to read files that are already shown.
+- Files under todosst/ were imported from the user's todosst app (one per top-level folder; group is the folder path). Edit them like any other file, but know that importing from todosst again replaces that folder. To make a change survive re-imports, move the task to a file outside todosst/ (keep its title or id so its history stays attached).
 - Organize by area of life: e.g. routines/morning.js, health.js, errands.js, work/project-x.js. Prefer editing an existing fitting file over making new ones. Keep files readable for a human: short comments only where they help.
 - Use edit_file for small changes and write_file for new files or rewrites. Use delete_file to remove a file.
 - After changing anything, call run to check for errors and see the resulting list for today (or a given date). Fix errors before you finish.

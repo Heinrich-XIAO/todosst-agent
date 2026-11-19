@@ -18,6 +18,13 @@ task("Charge power bank", { repeat: "daily", from: "20:00", after: "Get my power
 - **Every change is undoable.** `convex/program.ts` records each agent turn and hand edit as a message with before/after file contents. Undo restores a file only if nothing changed it since.
 - **Completions** are an append-only log (`convex/log.ts`). Unchecking writes a negative entry.
 
+## Moving to and from todosst
+
+The **todosst ⇄** button in the header moves your data both ways through todosst's own passphrase-protected backup file (`src/lib/todosst.ts`, tested in `src/lib/todosst.test.ts`).
+
+- **todosst → here:** export in todosst's settings, then import the file here. Each top-level folder becomes `todosst/<folder>.js` (`group` is the folder path), schedules carry over (readable names where they exist, otherwise the RRULE itself, which the runtime runs), and history becomes log entries. Importing again replaces the `todosst/` files and only tops up log totals (`log.importTotals`), so nothing counts twice. Completed one-offs, avoid tasks and the "open todosst" habit stay in todosst.
+- **here → todosst:** "Download for todosst" writes a backup of the program and log. Import it in todosst's settings with *merge by path* on: tasks match by folder path and title, so existing ones are updated (their tags, priority and reminders are kept) and only new ones are added.
+
 ## Develop
 
 ```bash

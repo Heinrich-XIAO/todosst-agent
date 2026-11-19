@@ -26,3 +26,29 @@ export const add = mutation({
     await ctx.db.insert("log", { userId, task, period, amount, at: Date.now() });
   },
 });
+
+// Brings in history from a todosst backup. Each entry is the total a task
+// should have for a period; only the missing part is added, so importing the
+// same backup twice never double counts.
+export const importTotals = mutation({
+  args: { entries: v.array(v.object({ task: v.string(), period: v.string(), amount: v.number(), at: v.number() })) },
+  handler: async (ctx, { entries }) => {
+    const userId = await requireUserId(ctx);
+    if (entries.length > 500) throw new ConvexError("too many entries in one batch");
+    let added = 0;
+    for (const { task, period, amount, at } of entries) {
+      if (task.length > 120 || period.length > 40 || !Number.isFinite(amount) || amount <= 0 || amount > 100_000 || !Number.isFinite(at)) {
+        throw new ConvexError("bad log entry");
+      }
+      const rows = await ctx.db
+        .query("log")
+        .withIndex("by_user_task_period", (q) => q.eq("userId", userId).eq("task", task).eq("period", period))
+        .collect();
+      const missing = amount - rows.reduce((sum, r) => sum + r.amount, 0);
+      if (missing <= 0) continue;
+      await ctx.db.insert("log", { userId, task, period, amount: missing, at: Math.min(at, Date.now()) });
+      added++;
+    }
+    return added;
+  },
+});
