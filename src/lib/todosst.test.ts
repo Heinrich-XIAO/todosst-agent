@@ -5,11 +5,15 @@ import {
   buildSnapshot,
   dateToDay,
   dayToDate,
+  decodeCompactCounts,
+  encodeCompactCounts,
   openBackup,
   planImport,
+  planPush,
   rruleFromTask,
   sameRule,
   scheduleFromRrule,
+  type RemoteSnapshot,
   type Snapshot,
   type TodosstNode,
 } from "./todosst";
@@ -247,5 +251,158 @@ describe("backup file", () => {
     expect(JSON.parse(file).format).toBe("todosst-export");
     expect((await openBackup(file, "correct horse")).todos.length).toBe(SNAP.todos.length);
     await expect(openBackup(file, "wrong pass")).rejects.toThrow("Wrong passphrase");
+  });
+});
+
+describe("direct two-way sync", () => {
+  const toRemote = (snap: Snapshot, createdAt = NOW - 7 * 86_400_000): RemoteSnapshot => ({
+    todos: snap.todos.map((t) => ({ id: t.id, createdAt, node: t.node })),
+    history: snap.history.map((h, i) => ({ id: `hist-${i}`, todoId: h.todoId, counts: { ...h.counts } })),
+  });
+
+  test("compact counts codec matches todosst format", () => {
+    const encoded = encodeCompactCounts({ "20777": 2, "20776": 1, "20778": 0 });
+    expect(encoded).toBe("d20776:1;d20777:2");
+    expect(decodeCompactCounts(encoded)).toEqual({ "20776": 1, "20777": 2 });
+  });
+
+  test("pushing an unchanged pull emits zero remote writes", () => {
+    const remote = toRemote(SNAP);
+    const pulled = planImport(SNAP, { files: {}, existing: [], now: NOW });
+    const files = Object.fromEntries(pulled.changes.map((c) => [c.path, c.source as string]));
+    const log: LogEntry[] = pulled.log.map((l) => ({ ...l }));
+    const ev = program(files, log);
+    const push = planPush(ev.tasks, log, remote, { now: NOW });
+    expect(push.creates).toEqual([]);
+    expect(push.updates).toEqual([]);
+    expect(push.histories).toEqual([]);
+  });
+
+  test("push merges completions into existing remote task, updates current counts and history, and preserves todosst-only metadata", () => {
+    const day18 = String(dateToDay("2026-11-18"));
+    const day19 = String(dateToDay("2026-11-19"));
+    const remote: RemoteSnapshot = {
+      todos: [
+        { id: "f1", createdAt: NOW - 10 * 86_400_000, node: node("health", null, 0) },
+        {
+          id: "t1",
+          createdAt: NOW - 10 * 86_400_000,
+          node: node("stretch", "f1", 0, {
+            recur: "FREQ=DAILY",
+            priority: "high",
+            tags: ["morning"],
+            graceHours: 6,
+            counts: { [day18]: 1 },
+          }),
+        },
+        {
+          id: "t2",
+          createdAt: NOW - 10 * 86_400_000,
+          node: node("buy milk", null, 1, { color: "blue" }, false),
+        },
+      ],
+      history: [{ id: "h1", todoId: "t1", counts: { [day18]: 1 } }],
+    };
+
+    const files = {
+      "health.js": `
+        task("stretch", { repeat: "daily", group: "health" });
+        task("floss", { repeat: "daily", group: "health" });
+        task("walk", { group: "errands / outside" });
+        task("buy milk");`,
+    };
+    const log: LogEntry[] = [
+      { task: "stretch", period: "2026-11-19", amount: 1, at: NOW },
+      { task: "buy-milk", period: "once", amount: 1, at: NOW },
+      { task: "floss", period: "2026-11-19", amount: 1, at: NOW },
+    ];
+
+    const push = planPush(program(files, log).tasks, log, remote, { now: NOW });
+
+    // Existing health folder reused; new errands/outside folders + floss + walk created
+    expect(push.createdTasks).toBe(2);
+    const createdNodes = push.creates.map((c) => ({ clientId: c.clientId, parentId: c.parentId, node: JSON.parse(c.nodeJson) as TodosstNode }));
+    const floss = createdNodes.find((c) => c.node.title === "floss")!;
+    expect(floss.parentId).toBe("f1");
+    expect(floss.node.metadata.counts).toEqual({ [day19]: 1 });
+    const errands = createdNodes.find((c) => c.node.title === "errands")!;
+    const outside = createdNodes.find((c) => c.node.title === "outside")!;
+    const walk = createdNodes.find((c) => c.node.title === "walk")!;
+    expect(outside.parentId).toBe(errands.clientId);
+    expect(walk.parentId).toBe(outside.clientId);
+
+    // Existing stretch updated with today's count while keeping priority/tags/graceHours
+    const stretchUpd = push.updates.find((u) => u.id === "t1")!;
+    const stretchNode = JSON.parse(stretchUpd.nodeJson) as TodosstNode;
+    expect(stretchNode.metadata.priority).toBe("high");
+    expect(stretchNode.metadata.tags).toEqual(["morning"]);
+    expect(stretchNode.metadata.graceHours).toBe(6);
+    expect(stretchNode.metadata.counts).toEqual({ [day18]: 1, [day19]: 1 });
+
+    // Existing buy milk marked completed while keeping color
+    const milkUpd = push.updates.find((u) => u.id === "t2")!;
+    const milkNode = JSON.parse(milkUpd.nodeJson) as TodosstNode;
+    expect(milkNode.isCompleted).toBe(true);
+    expect(milkNode.metadata.color).toBe("blue");
+
+    // Existing history row patched in place (reuses historyId "h1") and merges day18 + day19
+    const stretchHist = push.histories.find((h) => h.todoId === "t1")!;
+    expect(stretchHist.historyId).toBe("h1");
+    expect(stretchHist.counts).toEqual({ [day18]: 1, [day19]: 1 });
+
+    // New floss task also gets a history row pointing at its clientId
+    const flossHist = push.histories.find((h) => h.todoId === floss.clientId)!;
+    expect(flossHist.historyId).toBeUndefined();
+    expect(flossHist.counts).toEqual({ [day19]: 1 });
+  });
+
+  test("skips untouched onboarding placeholder task when pushing", () => {
+    const files = {
+      "today.js": `task("Tell the agent what you want to keep track of");`,
+    };
+    const push = planPush(program(files).tasks, [], { todos: [], history: [] }, { now: NOW });
+    expect(push.creates).toEqual([]);
+  });
+
+  test("pull marks a kept one-off task done when completed in todosst and avoids duplicating custom-id tasks", () => {
+    const files = {
+      "routines.js": `
+        task("Email", { id: "my-email", group: "work", repeat: "daily" });
+        task("Pay rent", { id: "rent-once" });`,
+    };
+    const ev = program(files);
+    const snap: Snapshot = {
+      v: 1,
+      todos: [
+        { id: "w", node: node("work", null, 0) },
+        { id: "e", node: node("Email", "w", 0, { recur: "FREQ=DAILY" }) },
+        { id: "r", node: node("Pay rent", null, 1, { completedAt: NOW - 1000 }, true) },
+      ],
+      history: [{ todoId: "e", counts: { [dateToDay("2026-11-19")]: 1 } }],
+    };
+
+    const plan = planImport(snap, { files, existing: ev.tasks, now: NOW });
+    expect(plan.tasks).toBe(0);
+    expect(plan.kept).toBe(2);
+    expect(plan.changes).toEqual([]);
+    expect(plan.log.find((l) => l.task === "my-email")).toMatchObject({ period: "2026-11-19", amount: 1 });
+    expect(plan.log.find((l) => l.task === "rent-once")).toMatchObject({ period: "once", amount: 1 });
+  });
+
+  test("weekly task completion aligns with todosst's anchored window day", () => {
+    // Anchor created on Wed 2026-11-04; on Thu 2026-11-19, todosst's current window is Wed 2026-11-18
+    const wed4 = new Date(2026, 10, 4, 10, 0).getTime();
+    const wed18 = String(dateToDay("2026-11-18"));
+    const remote: RemoteSnapshot = {
+      todos: [{ id: "w1", createdAt: wed4, node: node("Laundry", null, 0, { recur: "FREQ=WEEKLY" }) }],
+      history: [],
+    };
+    const files = { "home.js": `task("Laundry", { repeat: "weekly" });` };
+    const log: LogEntry[] = [{ task: "laundry", period: "week-2026-11-16", amount: 1, at: NOW }];
+
+    const push = planPush(program(files, log).tasks, log, remote, { now: NOW });
+    const upd = JSON.parse(push.updates[0].nodeJson) as TodosstNode;
+    expect(upd.metadata.counts).toEqual({ [wed18]: 1 });
+    expect(push.histories[0].counts).toEqual({ [wed18]: 1 });
   });
 });

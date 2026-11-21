@@ -40,4 +40,17 @@ export default defineSchema({
     revertedAt: v.optional(v.number()),
     at: v.number(),
   }).index("by_user_at", ["userId", "at"]),
+
+  // Saved session to the user's todosst account for direct two-way sync.
+  // Only Convex Auth session tokens are stored — never the todosst password.
+  todosstConnections: defineTable({
+    userId: v.string(),
+    url: v.string(),
+    username: v.string(),
+    token: v.string(),
+    refreshToken: v.string(),
+    connectedAt: v.number(),
+    lastSyncedAt: v.optional(v.number()),
+    lastSummary: v.optional(v.string()),
+  }).index("by_user", ["userId"]),
 });

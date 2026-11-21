@@ -15,6 +15,7 @@ import type * as http from "../http.js";
 import type * as log from "../log.js";
 import type * as program from "../program.js";
 import type * as seed from "../seed.js";
+import type * as todosstSync from "../todosstSync.js";
 import type * as userScope from "../userScope.js";
 
 import type {
@@ -31,6 +32,7 @@ declare const fullApi: ApiFromModules<{
   log: typeof log;
   program: typeof program;
   seed: typeof seed;
+  todosstSync: typeof todosstSync;
   userScope: typeof userScope;
 }>;
 

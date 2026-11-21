@@ -26,6 +26,7 @@ function Workspace() {
   const seed = useMutation(api.program.seed);
   const program = useProgram();
   const messages = useQuery(api.program.messages) as Message[] | undefined;
+  const todosstConn = useQuery(api.todosstSync.status);
   const prior = useMemo(() => (messages ?? []).map((m) => ({ role: m.role, text: m.text })), [messages]);
   const agent = useAgent(program.files, program.log, prior);
   const [tab, setTab] = useState<Tab>("today");
@@ -73,8 +74,13 @@ function Workspace() {
             </nav>
           </div>
           <div className="flex items-center gap-4">
-            <button onClick={() => setMoving(true)} className="text-sm text-muted hover:text-ink" title="Move to and from todosst">
-              todosst ⇄
+            <button
+              onClick={() => setMoving(true)}
+              className="flex items-center gap-1.5 text-sm text-muted hover:text-ink"
+              title={todosstConn ? `Synced with todosst (@${todosstConn.username})` : "Sync with todosst"}
+            >
+              {todosstConn && <span className="size-1.5 rounded-full bg-done" aria-hidden />}
+              <span>todosst ⇄</span>
             </button>
             <button onClick={() => signOut()} className="text-sm text-muted hover:text-ink">
               sign out

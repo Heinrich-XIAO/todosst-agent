@@ -226,6 +226,13 @@ export function sameRule(a: string, b: string): boolean {
       .toUpperCase()
       .split(";")
       .filter(Boolean)
+      .map((part) => {
+        const eq = part.indexOf("=");
+        if (eq < 0) return part;
+        const k = part.slice(0, eq);
+        const v = part.slice(eq + 1);
+        return v.includes(",") ? `${k}=${v.split(",").sort().join(",")}` : part;
+      })
       .sort()
       .join(";");
   return body(a) === body(b);
@@ -307,7 +314,13 @@ export function planImport(
   for (const list of byParent.values()) list.sort((a, b) => a.node.order - b.node.order);
 
   const kept = new Map<string, TaskInfo>();
-  for (const t of opts.existing) if (!t.file.startsWith(IMPORT_DIR)) kept.set(t.id, t);
+  const keptByPath = new Map<string, TaskInfo>();
+  for (const t of opts.existing) {
+    if (t.file.startsWith(IMPORT_DIR)) continue;
+    kept.set(t.id, t);
+    const pKey = pathKeyOf(splitGroup(t.group), t.title);
+    if (!keptByPath.has(pKey)) keptByPath.set(pKey, t);
+  }
   const used = new Set<string>(kept.keys());
   const plan: ImportPlan = { changes: [], log: [], tasks: 0, kept: 0, skipped: { completed: 0, avoid: 0, habit: 0 }, approximate: [] };
 
@@ -334,16 +347,33 @@ export function planImport(
     const recurring = typeof meta.recur === "string" && meta.recur.trim() !== "";
     if (meta.neg) return void plan.skipped.avoid++;
     if (meta.habit) return void plan.skipped.habit++;
-    if (!recurring && node.isCompleted) return void plan.skipped.completed++;
     const title = node.title.trim();
     if (!title) return;
+
+    // Match tasks defined outside todosst/ by normalized path first, then by id + title.
+    let id = slug(title).slice(0, MAX_ID);
+    const byPath = keptByPath.get(pathKeyOf(trail, title));
+    const byId = kept.get(id);
+    const matchedKept = byPath ?? (byId && byId.title.toLowerCase() === title.toLowerCase() ? byId : undefined);
+
+    if (!recurring && node.isCompleted) {
+      // If a one-off defined in the user's own files was completed in todosst,
+      // bring its completion into the log so it shows as done here too.
+      if (matchedKept && matchedKept.per === "once") {
+        const at = typeof meta.completedAt === "number" && Number.isFinite(meta.completedAt) ? meta.completedAt : opts.now;
+        const amount = Number.isFinite(matchedKept.goal) && matchedKept.goal > 0 ? Math.min(Math.floor(matchedKept.goal), 100_000) : 1;
+        plan.log.push({ task: matchedKept.id, period: "once", amount, at });
+        plan.kept++;
+        return;
+      }
+      return void plan.skipped.completed++;
+    }
     const counts = countsOf(node, history, todoId);
 
-    // id: the title's slug, made unique with the folder path when needed
-    let id = slug(title).slice(0, MAX_ID);
-    const same = kept.get(id);
-    const isKept = same !== undefined && same.title.toLowerCase() === title.toLowerCase();
-    if (!isKept) {
+    const isKept = matchedKept !== undefined;
+    if (isKept) {
+      id = matchedKept.id;
+    } else {
       if (!id || used.has(id)) id = slug([...trail, title].join(" ")).slice(0, MAX_ID) || "task";
       for (let n = 2, base = id; used.has(id); n++) id = `${base.slice(0, MAX_ID - 4)}-${n}`;
       used.add(id);
@@ -513,4 +543,474 @@ export function buildSnapshot(tasks: TaskInfo[], log: LogEntry[]): Snapshot {
 
 export function backupFilename(now = new Date()): string {
   return `todosst-agent-export-${localDate(now.getTime())}.json`;
+}
+
+// ---------- direct two-way sync against todosst's Convex API ----------
+
+const COUNT_MAX = 9999;
+const COUNT_TOKEN_RE = /^d(\d{3,7}):(\d{1,5})$/;
+const RECENT_COUNTS_WINDOW_DAYS = 31;
+const STARTER_PLACEHOLDER_ID = "tell-the-agent-what-you-want-to-keep-track-of";
+
+function splitGroup(group: string | undefined): string[] {
+  return (group ?? "").split(FOLDER_SEP).map((p) => p.trim()).filter(Boolean);
+}
+
+function pathKeyOf(trail: string[], title: string): string {
+  return [...trail, title].map((s) => s.trim().toLowerCase()).join("\0");
+}
+
+/** Compact counts codec matching todosst/src/lib/recur.ts ("d20776:1;d20777:2"). */
+export function encodeCompactCounts(counts: Record<string, number>): string {
+  const seen = new Map<number, number>();
+  for (const [k, v] of Object.entries(counts)) {
+    const day = Number(k);
+    const count = Number(v);
+    if (!Number.isFinite(day) || !Number.isFinite(count)) continue;
+    const n = Math.min(Math.floor(count), COUNT_MAX);
+    if (n <= 0) continue;
+    const d = Math.floor(day);
+    seen.set(d, Math.max(seen.get(d) ?? 0, n));
+  }
+  return Array.from(seen.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([d, n]) => `d${d}:${n}`)
+    .join(";");
+}
+
+export function decodeCompactCounts(s: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!s) return out;
+  for (const token of s.split(";")) {
+    const m = COUNT_TOKEN_RE.exec(token.trim());
+    if (!m) continue;
+    const day = Number(m[1]);
+    const count = Math.min(Number(m[2]), COUNT_MAX);
+    if (count > 0) out[String(day)] = count;
+  }
+  return out;
+}
+
+export type RemoteTodo = { id: string; createdAt: number; node: TodosstNode };
+export type RemoteHistory = { id: string; todoId: string; counts: Record<string, number> };
+export type RemoteSnapshot = { todos: RemoteTodo[]; history: RemoteHistory[] };
+
+export type PushCreate = { clientId: string; parentId: string | null; nodeJson: string; isFolder?: boolean };
+export type PushUpdate = { id: string; nodeJson: string };
+export type PushHistory = { historyId?: string; todoId: string; counts: Record<string, number> };
+
+export type PushPlan = {
+  creates: PushCreate[];
+  updates: PushUpdate[];
+  histories: PushHistory[];
+  createdTasks: number;
+  updatedTasks: number;
+  updatedHistories: number;
+};
+
+/**
+ * For a non-daily recurring rule without explicit BYDAY/BYMONTHDAY (plain
+ * WEEKLY, MONTHLY, YEARLY), compute the day index of todosst's current window
+ * anchored at dtstart or creation time, when it falls inside `period`.
+ */
+function alignedWindowDay(recur: string, createdAt: number, per: Per, period: string, today: string): number | null {
+  if (per === "day" || per === "once") return null;
+  let rule;
+  try {
+    rule = parseRrule(recur);
+  } catch {
+    return null;
+  }
+  if (rule.byday.length || rule.bymonthday.length || rule.bymonth.length) return null;
+  const anchorDate = rule.dtstart ?? (createdAt > 0 ? localDate(createdAt) : today);
+  const anchorIdx = dateToDay(anchorDate);
+  const todayIdx = dateToDay(today);
+  if (anchorIdx > todayIdx) return null;
+  let candIdx: number | null = null;
+  if (rule.freq === "WEEKLY") {
+    const step = rule.interval * 7;
+    candIdx = anchorIdx + Math.floor((todayIdx - anchorIdx) / step) * step;
+  } else if (rule.freq === "MONTHLY") {
+    const [ay, am, ad] = anchorDate.split("-").map(Number);
+    const [ty, tm, td] = today.split("-").map(Number);
+    const months = (ty - ay) * 12 + (tm - am);
+    const step = rule.interval;
+    let m = Math.floor(months / step) * step;
+    for (let tries = 0; tries < 24 && m >= 0; tries++, m -= step) {
+      const y = ay + Math.floor((am - 1 + m) / 12);
+      const mo = ((am - 1 + m) % 12) + 1;
+      const dim = new Date(y, mo, 0).getDate();
+      if (ad > dim) continue;
+      if (y > ty || (y === ty && mo > tm) || (y === ty && mo === tm && ad > td)) continue;
+      candIdx = dateToDay(`${y}-${pad(mo)}-${pad(ad)}`);
+      break;
+    }
+  } else if (rule.freq === "YEARLY") {
+    const [ay, am, ad] = anchorDate.split("-").map(Number);
+    const [ty, tm, td] = today.split("-").map(Number);
+    const years = ty - ay;
+    const step = rule.interval;
+    let y = ay + Math.floor(years / step) * step;
+    if (y === ty && (am > tm || (am === tm && ad > td))) y -= step;
+    if (y >= ay) {
+      const dim = new Date(y, am, 0).getDate();
+      if (ad <= dim) candIdx = dateToDay(`${y}-${pad(am)}-${pad(ad)}`);
+    }
+  }
+  if (candIdx === null) return null;
+  const candDate = dayToDate(candIdx);
+  return periodKey(per, candDate) === period ? candIdx : null;
+}
+
+function desiredMode(t: TaskInfo): { mode: "check" | "count" | "time"; threshold: number | null } {
+  if (t.unit === "min") return { mode: "time", threshold: t.goal };
+  if (!Number.isFinite(t.goal)) return { mode: "count", threshold: null };
+  if (t.unit) return { mode: "count", threshold: t.goal };
+  return { mode: "check", threshold: t.goal };
+}
+
+function normalizedMode(meta: TodosstMeta): { mode: "check" | "count" | "time"; threshold: number | null } {
+  const mode = meta.mode === "time" || meta.mode === "count" ? meta.mode : "check";
+  const raw = typeof meta.threshold === "number" && Number.isFinite(meta.threshold) && meta.threshold >= 1 ? Math.floor(meta.threshold) : null;
+  if (mode === "count") return { mode, threshold: raw };
+  return { mode, threshold: raw ?? 1 };
+}
+
+/**
+ * Plans the minimal non-destructive push from todosst-agent into a live todosst
+ * account. Matches existing folders and tasks by normalized folder path + title,
+ * preserves todosst-only metadata, merges completion counts with max(), and
+ * emits writes only for rows that actually changed.
+ */
+export function planPush(
+  tasks: TaskInfo[],
+  log: LogEntry[],
+  remote: RemoteSnapshot,
+  opts: { now: number },
+): PushPlan {
+  const today = localDate(opts.now);
+  const todayIdx = dateToDay(today);
+
+  // Build path lookup for existing remote todos
+  const remoteById = new Map(remote.todos.map((t) => [t.id, t]));
+  const pathMemo = new Map<string, string[]>();
+  const segmentsOf = (id: string, seen = new Set<string>()): string[] => {
+    const cached = pathMemo.get(id);
+    if (cached) return cached;
+    const item = remoteById.get(id);
+    if (!item || seen.has(id)) return [];
+    seen.add(id);
+    const parent = item.node.parentId && remoteById.has(item.node.parentId) ? segmentsOf(item.node.parentId, seen) : [];
+    const segs = [...parent, item.node.title.trim()];
+    pathMemo.set(id, segs);
+    return segs;
+  };
+
+  // On path collisions (e.g., an old completed one-off and a fresh open task),
+  // prefer recurring or open tasks over completed one-offs.
+  const isActiveOrRecurring = (n: TodosstNode) => !n.isCompleted || Boolean(n.metadata?.recur?.trim());
+  const remoteByPath = new Map<string, RemoteTodo>();
+  const nextOrderByParent = new Map<string, number>();
+  const parentKey = (p: string | null) => p ?? "\u0000root";
+  for (const r of remote.todos) {
+    const pk = parentKey(r.node.parentId);
+    const ord = typeof r.node.order === "number" && Number.isFinite(r.node.order) ? r.node.order : 0;
+    nextOrderByParent.set(pk, Math.max(nextOrderByParent.get(pk) ?? 0, ord + 1));
+    const segs = segmentsOf(r.id);
+    if (!segs.length) continue;
+    const key = segs.map((s) => s.toLowerCase()).join("\0");
+    const prev = remoteByPath.get(key);
+    if (!prev || (!isActiveOrRecurring(prev.node) && isActiveOrRecurring(r.node))) {
+      remoteByPath.set(key, r);
+    }
+  }
+  const takeOrder = (parentId: string | null) => {
+    const pk = parentKey(parentId);
+    const ord = nextOrderByParent.get(pk) ?? 0;
+    nextOrderByParent.set(pk, ord + 1);
+    return ord;
+  };
+
+  const remoteHistoryByTodo = new Map<string, RemoteHistory>();
+  for (const h of remote.history) remoteHistoryByTodo.set(h.todoId, h);
+
+  // Totals per task + period from local log
+  const totals = new Map<string, Map<string, { amount: number; at: number }>>();
+  for (const e of log) {
+    const m = totals.get(e.task) ?? new Map();
+    const cur = m.get(e.period) ?? { amount: 0, at: 0 };
+    m.set(e.period, { amount: cur.amount + e.amount, at: e.amount > 0 ? Math.max(cur.at, e.at) : cur.at });
+    totals.set(e.task, m);
+  }
+
+  const creates: PushCreate[] = [];
+  const updates: PushUpdate[] = [];
+  const histories: PushHistory[] = [];
+  let createdTasks = 0;
+  let updatedTasks = 0;
+  let updatedHistories = 0;
+
+  // Map normalized folder path -> remote id or pending clientId
+  const folderIds = new Map<string, string>();
+  const ensureFolder = (parts: string[]): string | null => {
+    let parentId: string | null = null;
+    for (let i = 0; i < parts.length; i++) {
+      const prefix = parts.slice(0, i + 1);
+      const key = prefix.map((s) => s.toLowerCase()).join("\0");
+      const known = folderIds.get(key);
+      if (known) {
+        parentId = known;
+        continue;
+      }
+      const existing = remoteByPath.get(key);
+      if (existing) {
+        folderIds.set(key, existing.id);
+        parentId = existing.id;
+        continue;
+      }
+      const clientId = `folder:${key}`;
+      const node: TodosstNode = {
+        v: 2,
+        title: parts[i],
+        isCompleted: false,
+        parentId,
+        order: takeOrder(parentId),
+        metadata: {},
+      };
+      creates.push({ clientId, parentId, nodeJson: JSON.stringify(node), isFolder: true });
+      folderIds.set(key, clientId);
+      parentId = clientId;
+    }
+    return parentId;
+  };
+
+  const seenPaths = new Set<string>();
+
+  for (const t of tasks) {
+    const taskPeriods = totals.get(t.id);
+    // Don't pollute the user's todosst account with the untouched onboarding placeholder.
+    if (t.id === STARTER_PLACEHOLDER_ID && t.file === "today.js" && (!taskPeriods || taskPeriods.size === 0)) {
+      continue;
+    }
+
+    const parts = splitGroup(t.group);
+    const key = pathKeyOf(parts, t.title);
+    if (seenPaths.has(key)) continue;
+    seenPaths.add(key);
+
+    const existing = remoteByPath.get(key);
+    const recur = rruleFromTask(t);
+    const localCounts: Record<string, number> = {};
+    let localDone = false;
+    let localDoneAt = 0;
+    const currentPeriod = periodKey(t.per, today);
+    const remoteRecur = existing?.node.metadata.recur ?? recur;
+
+    for (const [period, { amount, at }] of taskPeriods ?? []) {
+      if (!(amount > 0)) continue;
+      let dayIdx: number | null = null;
+      if (t.per === "day" && /^\d{4}-\d{2}-\d{2}$/.test(period)) {
+        dayIdx = dateToDay(period);
+      } else if (period === currentPeriod && remoteRecur && existing) {
+        dayIdx = alignedWindowDay(remoteRecur, existing.createdAt, t.per, period, today);
+      }
+      if (dayIdx === null) {
+        const date = at ? localDate(at) : null;
+        if (date) dayIdx = dateToDay(date);
+      }
+      if (dayIdx !== null) {
+        const dk = String(dayIdx);
+        localCounts[dk] = Math.min(COUNT_MAX, Math.max(localCounts[dk] ?? 0, Math.floor(amount)));
+      }
+      if (period === "once" && amount >= t.goal) {
+        localDone = true;
+        localDoneAt = at;
+      }
+    }
+
+    if (existing) {
+      const oldNode = existing.node;
+      const oldMeta = oldNode.metadata ?? {};
+      if (oldMeta.neg || oldMeta.habit) continue;
+
+      const nextMeta: TodosstMeta = { ...oldMeta };
+      let nodeChanged = false;
+
+      // Schedule
+      const oldRecur = typeof oldMeta.recur === "string" && oldMeta.recur.trim() ? oldMeta.recur : null;
+      if (recur) {
+        if (!oldRecur || !sameRule(oldRecur, recur)) {
+          nextMeta.recur = recur;
+          nodeChanged = true;
+        }
+      } else if (oldRecur) {
+        delete nextMeta.recur;
+        nodeChanged = true;
+      }
+
+      // One-off due date / time
+      if (!recur) {
+        const oldDueDate = typeof oldMeta.dueAt === "number" && Number.isFinite(oldMeta.dueAt) ? localDate(oldMeta.dueAt) : null;
+        const nextDueDate = t.date ?? null;
+        if (oldDueDate !== nextDueDate) {
+          if (nextDueDate) {
+            const [y, m, d] = nextDueDate.split("-").map(Number);
+            nextMeta.dueAt = new Date(y, m - 1, d).getTime();
+          } else {
+            nextMeta.dueAt = null;
+          }
+          nodeChanged = true;
+        }
+        const nextMin =
+          nextDueDate && t.until
+            ? (() => {
+                const [h, min] = t.until.split(":").map(Number);
+                return h * 60 + min;
+              })()
+            : undefined;
+        const oldMin = typeof oldMeta.dueTimeMin === "number" ? oldMeta.dueTimeMin : undefined;
+        if (oldMin !== nextMin) {
+          if (nextMin === undefined) delete nextMeta.dueTimeMin;
+          else nextMeta.dueTimeMin = nextMin;
+          nodeChanged = true;
+        }
+      }
+
+      // Mode & threshold (compare semantically against todosst defaults)
+      const want = desiredMode(t);
+      const cur = normalizedMode(oldMeta);
+      if (want.mode !== cur.mode || want.threshold !== cur.threshold) {
+        nextMeta.mode = want.mode;
+        if (want.threshold === null) delete nextMeta.threshold;
+        else nextMeta.threshold = want.threshold;
+        nodeChanged = true;
+      }
+
+      // Notes / description
+      const oldDesc = typeof oldMeta.description === "string" ? oldMeta.description.trim() : "";
+      const nextDesc = (t.notes ?? "").trim();
+      if (oldDesc !== nextDesc) {
+        if (nextDesc) nextMeta.description = nextDesc;
+        else delete nextMeta.description;
+        nodeChanged = true;
+      }
+
+      // Completion state & current-window counts
+      const remoteHist = remoteHistoryByTodo.get(existing.id);
+      let nextCompleted = oldNode.isCompleted;
+      if (!recur) {
+        if (localDone && !oldNode.isCompleted) {
+          nextCompleted = true;
+          nextMeta.completedAt = localDoneAt || opts.now;
+          nodeChanged = true;
+        }
+      } else {
+        const prevCounts = oldMeta.counts ?? {};
+        const prevHistCounts = remoteHist?.counts ?? {};
+        const nextCounts: Record<string, number> = { ...prevCounts };
+        let countsChanged = false;
+        const latestLocal = Object.keys(localCounts)
+          .map(Number)
+          .sort((a, b) => b - a)[0];
+        for (const [dk, val] of Object.entries(localCounts)) {
+          const day = Number(dk);
+          if (day < todayIdx - RECENT_COUNTS_WINDOW_DAYS && day !== latestLocal) continue;
+          const prevKnown = Math.max(
+            typeof nextCounts[dk] === "number" ? nextCounts[dk] : 0,
+            typeof prevHistCounts[dk] === "number" ? prevHistCounts[dk] : 0,
+          );
+          if (val > prevKnown) {
+            nextCounts[dk] = val;
+            countsChanged = true;
+          }
+        }
+        if (countsChanged) {
+          nextMeta.counts = nextCounts;
+          nodeChanged = true;
+        }
+      }
+
+      if (nodeChanged) {
+        const nextNode: TodosstNode = {
+          v: 2,
+          title: oldNode.title,
+          isCompleted: nextCompleted,
+          parentId: oldNode.parentId,
+          order: oldNode.order,
+          metadata: nextMeta,
+        };
+        updates.push({ id: existing.id, nodeJson: JSON.stringify(nextNode) });
+        updatedTasks++;
+      }
+
+      // Merge history monotonically (max per day across remote history + remote counts + local counts)
+      const mergedHistory: Record<string, number> = {};
+      for (const src of [remoteHist?.counts ?? {}, oldMeta.counts ?? {}, localCounts]) {
+        for (const [dk, val] of Object.entries(src)) {
+          const day = Number(dk);
+          if (!Number.isInteger(day) || typeof val !== "number" || !(val > 0)) continue;
+          const n = Math.min(COUNT_MAX, Math.floor(val));
+          mergedHistory[dk] = Math.max(mergedHistory[dk] ?? 0, n);
+        }
+      }
+      const prevEncoded = encodeCompactCounts(remoteHist?.counts ?? {});
+      const nextEncoded = encodeCompactCounts(mergedHistory);
+      if (nextEncoded && nextEncoded !== prevEncoded) {
+        histories.push({ historyId: remoteHist?.id, todoId: existing.id, counts: mergedHistory });
+        updatedHistories++;
+      }
+    } else {
+      // Create new task (and any missing parent folders first)
+      const parentId = ensureFolder(parts);
+      const meta: TodosstMeta = {};
+      if (recur) meta.recur = recur;
+      const want = desiredMode(t);
+      if (want.mode !== "check" || (want.threshold !== null && want.threshold !== 1)) {
+        meta.mode = want.mode;
+        if (want.threshold !== null) meta.threshold = want.threshold;
+      }
+      if (!recur) {
+        if (t.date) {
+          const [y, m, d] = t.date.split("-").map(Number);
+          meta.dueAt = new Date(y, m - 1, d).getTime();
+          if (t.until) {
+            const [h, min] = t.until.split(":").map(Number);
+            meta.dueTimeMin = h * 60 + min;
+          }
+        } else {
+          meta.dueAt = null;
+        }
+        meta.completedAt = localDone ? localDoneAt || opts.now : null;
+      } else {
+        const recent: Record<string, number> = {};
+        const latestLocal = Object.keys(localCounts)
+          .map(Number)
+          .sort((a, b) => b - a)[0];
+        for (const [dk, val] of Object.entries(localCounts)) {
+          const day = Number(dk);
+          if (day >= todayIdx - RECENT_COUNTS_WINDOW_DAYS || day === latestLocal) recent[dk] = val;
+        }
+        if (Object.keys(recent).length) meta.counts = recent;
+      }
+      if (t.notes?.trim()) meta.description = t.notes.trim();
+
+      const clientId = `task:${t.id}`;
+      const node: TodosstNode = {
+        v: 2,
+        title: t.title,
+        isCompleted: !recur && localDone,
+        parentId,
+        order: takeOrder(parentId),
+        metadata: meta,
+      };
+      creates.push({ clientId, parentId, nodeJson: JSON.stringify(node) });
+      createdTasks++;
+      if (Object.keys(localCounts).length) {
+        histories.push({ todoId: clientId, counts: localCounts });
+        updatedHistories++;
+      }
+    }
+  }
+
+  return { creates, updates, histories, createdTasks, updatedTasks, updatedHistories };
 }
